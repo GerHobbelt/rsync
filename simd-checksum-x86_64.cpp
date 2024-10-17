@@ -525,7 +525,7 @@ static int32 get_checksum1_auto(schar* buf, int32 len, int32 i, uint32* ps1, uin
     return len;
 }
 
-int main() {
+int main(void) {
     int i;
     unsigned char* buf = (unsigned char*)aligned_alloc(64,BLOCK_LEN);
     for (i = 0; i < BLOCK_LEN; i++) buf[i] = (i + (i % 3) + (i % 11)) % 256;
