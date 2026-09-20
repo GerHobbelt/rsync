@@ -10,9 +10,13 @@ import os
 import shutil
 
 from rsyncfns import (
-    FROMDIR, RSYNC, SCRATCHDIR, TODIR,
-    build_rsyncd_conf, checkit, makepath, rmtree, run_rsync,
+    FROMDIR, SCRATCHDIR, TODIR,
+    build_rsyncd_conf, checkit, makepath, rmtree,
+    run_rsync, start_test_daemon,
 )
+
+
+DAEMON_PORT = 12875
 
 
 checkdir = SCRATCHDIR / 'check'
@@ -30,27 +34,30 @@ os.chmod(FROMDIR / 'dir2', 0o770)
 # Baseline copy of source.
 checkit(['-avv', f'{FROMDIR}/', f'{checkdir}/'], FROMDIR, checkdir)
 
+# Pin umask to 002 for the rest of the test and DO NOT restore it: rsync's
+# --chmod `D+w` honours the process umask, so the expected tree (built just
+# below) and the rsync run that follows must use the same umask -- exactly
+# as the shell test did (it set `umask 002` and left it in effect). Without
+# this the test fails under a different ambient umask (e.g. 077).
+os.umask(0o002)
+
 # Manually apply the mode transform that --chmod ug-s,a+rX,D+w should
 # produce on the destination, then verify rsync's transform matches.
-old_umask = os.umask(0o002)
-try:
-    for entry in checkdir.iterdir():
-        # ug-s,a+rX: clear setuid/setgid; add r everywhere; add x where
-        # any existing x or the entry is a dir.
-        st = entry.stat()
-        mode = st.st_mode & ~0o6000
-        mode |= 0o444  # a+r
-        if entry.is_dir() or (st.st_mode & 0o111):
-            mode |= 0o111  # a+X
-        os.chmod(entry, mode)
-    # `chmod +w` with no explicit who: adds w for every category not
-    # masked by the current umask. Under umask 002 that's u+w AND g+w.
-    plus_w = 0o222 & ~0o002
-    for d in (checkdir, checkdir / 'dir1', checkdir / 'dir2'):
-        st = d.stat()
-        os.chmod(d, st.st_mode | plus_w)
-finally:
-    os.umask(old_umask)
+for entry in checkdir.iterdir():
+    # ug-s,a+rX: clear setuid/setgid; add r everywhere; add x where
+    # any existing x or the entry is a dir.
+    st = entry.stat()
+    mode = st.st_mode & ~0o6000
+    mode |= 0o444  # a+r
+    if entry.is_dir() or (st.st_mode & 0o111):
+        mode |= 0o111  # a+X
+    os.chmod(entry, mode)
+# `chmod +w` with no explicit who: adds w for every category not masked by
+# the current umask. Under umask 002 that's u+w AND g+w.
+plus_w = 0o222 & ~0o002
+for d in (checkdir, checkdir / 'dir1', checkdir / 'dir2'):
+    st = d.stat()
+    os.chmod(d, st.st_mode | plus_w)
 
 checkit(['-avv', '--chmod', 'ug-s,a+rX,D+w', f'{FROMDIR}/', f'{TODIR}/'],
         checkdir, TODIR)
@@ -78,10 +85,11 @@ with open(conf, 'a') as f:
 \tincoming chmod = Fo-x
 """)
 
-os.environ['RSYNC_CONNECT_PROG'] = f"{RSYNC} --config={conf} --daemon"
+url = start_test_daemon(conf, DAEMON_PORT)
 
 rmtree(TODIR)
 makepath(TODIR)
 
-checkit(['-avv', '--no-perms', f'{FROMDIR}/', 'localhost::test-incoming-chmod/'],
+checkit(['-avv', '--no-perms', f'{FROMDIR}/',
+         f'{url}test-incoming-chmod/'],
         checkdir, TODIR, allowed_codes=(0, 23))

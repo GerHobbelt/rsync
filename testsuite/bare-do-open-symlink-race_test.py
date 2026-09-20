@@ -14,10 +14,13 @@ import stat
 import subprocess
 
 from rsyncfns import (
-    RSYNC, SCRATCHDIR,
+    SCRATCHDIR,
     get_rootgid, get_rootuid, get_testuid,
-    rmtree, rsync_argv, test_fail, test_skipped,
+    rmtree, rsync_argv, start_test_daemon, test_fail, test_skipped,
 )
+
+
+DAEMON_PORT = 12884
 
 
 if platform.system() in ('SunOS', 'OpenBSD', 'NetBSD') or platform.system().startswith('CYGWIN'):
@@ -66,28 +69,54 @@ if my_uid != root_uid:
     gid_line = '#' + gid_line
 
 
-def write_conf(module_name: str, fake_super: bool = False) -> None:
-    extra = "    fake super = yes\n" if fake_super else ""
-    conf.write_text(f"""\
+# All three scenarios use the same daemon -- they just target a different
+# module. Write both modules up-front so the daemon doesn't need to be
+# restarted between scenarios.
+conf.write_text(f"""\
 use chroot = no
 {uid_line}
 {gid_line}
 log file = {SCRATCHDIR}/rsyncd.log
-[{module_name}]
+[upload]
     path = {mod}
     use chroot = no
     read only = no
-{extra}""")
+
+[upload_fake]
+    path = {mod}
+    use chroot = no
+    read only = no
+    fake super = yes
+""")
+daemon_url = start_test_daemon(conf, DAEMON_PORT).rstrip('/')
 
 
 def run_attack(args):
-    env = os.environ.copy()
-    env['RSYNC_CONNECT_PROG'] = f"{RSYNC} --config={conf} --daemon"
-    subprocess.run(
+    """Run the (expected-to-be-contained) attack transfer and return its exit
+    code; output is discarded since the security assertion is on the filesystem."""
+    return subprocess.run(
         rsync_argv(*args),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env=env,
-    )
+    ).returncode
+
+
+def positive_control():
+    """Confirm the upload module accepts an ordinary write. Without this, every
+    scenario below would also pass if the daemon refused (or failed) before the
+    vulnerable code ran -- the sentinel-unchanged check alone can't tell a
+    securely-contained attack from one that never reached the receiver path."""
+    for d in (mod, src):
+        rmtree(d)
+        d.mkdir(parents=True)
+    (src / 'legit.txt').write_text("LEGIT_IN_MODULE\n")
+    rc = run_attack(['-t', f'{src}/legit.txt', f'{daemon_url}/upload/legit.txt'])
+    if rc != 0 or not (mod / 'legit.txt').is_file() \
+            or (mod / 'legit.txt').read_text() != "LEGIT_IN_MODULE\n":
+        test_fail(f"positive control: upload module did not accept a normal "
+                  f"write (rc={rc}); attack scenarios would be vacuous")
+
+
+positive_control()
 
 
 # Scenario 3b: --inplace --backup --backup-dir=cd
@@ -97,11 +126,12 @@ os.chmod(mod / 'target.txt', 0o666)
 (src / 'target.txt').write_text("NEW_DATA_FROM_SENDER\n")
 os.chmod(src / 'target.txt', 0o644)
 
-write_conf('upload')
-run_attack([
+rc = run_attack([
     '--inplace', '--backup', '--backup-dir=cd',
-    f'{src}/target.txt', 'rsync://localhost/upload/target.txt',
+    f'{src}/target.txt', f'{daemon_url}/upload/target.txt',
 ])
+if rc >= 128:
+    test_fail(f"3b inplace+backup-dir=cd: rsync died from a signal (rc={rc})")
 verify_outside_unchanged("3b inplace+backup-dir=cd")
 
 
@@ -110,8 +140,9 @@ setup()
 (src / 'cd').mkdir()
 os.symlink('/etc/passwd', src / 'cd' / 'sym')
 
-write_conf('upload_fake', fake_super=True)
-run_attack(['-rl', f'{src}/', 'rsync://localhost/upload_fake/'])
+rc = run_attack(['-rl', f'{src}/', f'{daemon_url}/upload_fake/'])
+if rc >= 128:
+    test_fail(f"3c-symlink: rsync died from a signal (rc={rc})")
 verify_outside_unchanged_or_absent("3c-symlink fake-super symlink push", "sym")
 
 
@@ -126,6 +157,7 @@ except OSError:
 if not stat.S_ISFIFO((src / 'cd' / 'fifo').stat().st_mode):
     test_skipped("mkfifo unavailable; cannot exercise 3c-mknod")
 
-write_conf('upload_fake', fake_super=True)
-run_attack(['-rD', f'{src}/', 'rsync://localhost/upload_fake/'])
+rc = run_attack(['-rD', f'{src}/', f'{daemon_url}/upload_fake/'])
+if rc >= 128:
+    test_fail(f"3c-mknod: rsync died from a signal (rc={rc})")
 verify_outside_unchanged_or_absent("3c-mknod fake-super FIFO push", "fifo")
